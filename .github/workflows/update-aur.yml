@@ -1,0 +1,103 @@
+# Builds terraprism-git from upstream main every day so a broken build or failing test
+# shows up here (a failed scheduled run emails the repo owner). It pushes to the AUR only
+# when the release part of pkgver changes, i.e. upstream cut a new tag. AUR helpers rebuild
+# -git packages with --devel anyway, so a push per commit would just spam package watchers.
+name: Update AUR package
+
+on:
+  schedule:
+    - cron: '30 6 * * *'   # daily 06:30 UTC, after the -bin updater
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Deploy even if upstream has no new tag'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-aur
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Build from upstream main & check for a new tag
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    outputs:
+      updated: ${{ steps.bump.outputs.updated }}
+      version: ${{ steps.bump.outputs.new_version }}
+    steps:
+      - name: Install build tooling
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git go sudo
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+
+      - uses: actions/checkout@v4
+
+      # makepkg runs pkgver() and writes the result back into PKGBUILD, and check()
+      # runs upstream's go tests, so this step is both the build test and the bump.
+      - name: Build package & regenerate .SRCINFO
+        run: |
+          chown -R builder .
+          old_ver=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          sudo -u builder makepkg -f --noconfirm
+          sudo -u builder makepkg --printsrcinfo > .SRCINFO
+          bin=$(sed -n 's/^_pkgname=//p' PKGBUILD)
+          ./pkg/terraprism-git/usr/bin/"$bin" --help > /dev/null
+          echo "old_ver=$old_ver" >> "$GITHUB_ENV"
+
+      - name: Decide whether upstream cut a new tag
+        id: bump
+        run: |
+          new_ver=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          # 0.13.0.r4.gabcdef0 -> 0.13.0
+          old_tag=${old_ver%%.r*}
+          new_tag=${new_ver%%.r*}
+          echo "pkgver: $old_ver -> $new_ver"
+          if [ "$old_tag" != "$new_tag" ]; then
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "no new upstream tag ($new_tag), not publishing"
+          fi
+          echo "new_version=$new_ver" >> "$GITHUB_OUTPUT"
+
+      - name: Commit bump to this repo
+        if: steps.bump.outputs.updated == 'true' || inputs.force
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          ver="${{ steps.bump.outputs.new_version }}"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "PKGBUILD unchanged, nothing to commit"
+          else
+            git commit -m "chore: bump terraprism-git to $ver"
+            git push
+          fi
+
+  deploy:
+    name: Publish to AUR
+    needs: check
+    if: needs.check.outputs.updated == 'true' || inputs.force
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Publish
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
+        with:
+          pkgname: terraprism-git
+          pkgbuild: ./PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ needs.check.outputs.version }}"
+          ssh_keyscan_types: rsa,ecdsa,ed25519
